@@ -163,7 +163,12 @@ final class ClaudeAuth {
     }
 }
 
-struct LimitWindow { let pct: Double; let resetsAt: Date? }
+struct LimitWindow {
+    let pct: Double
+    let resetsAt: Date?
+
+    var hasReset: Bool { resetsAt.map { $0 <= Date() } ?? false }
+}
 
 final class ClaudeProvider: UsageProvider {
     let id = "claude"
@@ -189,14 +194,13 @@ final class ClaudeProvider: UsageProvider {
     }
 
     var valueText: String {
-        guard let w = fiveHour else { return "–" }
-        // After the reset time has passed, the old number is meaningless
-        return (w.resetsAt.map { $0 < Date() } ?? false) ? "0%" : "\(Int(w.pct.rounded()))%"
+        guard let window = fiveHour, !window.hasReset else { return "–" }
+        return "\(Int(window.pct.rounded()))%"
     }
 
     var tooltip: String {
         guard let w = fiveHour else { return lastError ?? L("Claude: loading…", "Claude: wird geladen…") }
-        return L("Claude 5h limit", "Claude 5h-Limit") + ": \(Int(w.pct.rounded())) %" + (lastError.map { "\n\($0)" } ?? "")
+        return detail(w, label: L("Claude 5h limit", "Claude 5h-Limit")) + (lastError.map { "\n\($0)" } ?? "")
     }
 
     func tick(changed: @escaping () -> Void) {
@@ -270,10 +274,17 @@ final class ClaudeProvider: UsageProvider {
         return LimitWindow(pct: u, resetsAt: reset)
     }
 
+    private func detail(_ window: LimitWindow, label: String) -> String {
+        if window.hasReset {
+            return label + " · " + L("Waiting for new usage data", "Warte auf neue Nutzungsdaten")
+        }
+        return "\(label): \(Int(window.pct.rounded())) %  ·  Reset \(fmtTime(window.resetsAt))"
+    }
+
     func menuItems(changed: @escaping () -> Void) -> [NSMenuItem] {
         var items: [NSMenuItem] = []
-        if let w = fiveHour { items.append(infoItem(L("5 hours", "5 Stunden") + ": \(Int(w.pct.rounded())) %  ·  Reset \(fmtTime(w.resetsAt))")) }
-        if let w = sevenDay { items.append(infoItem(L("7 days", "7 Tage") + ": \(Int(w.pct.rounded())) %  ·  Reset \(fmtTime(w.resetsAt))")) }
+        if let w = fiveHour { items.append(infoItem(detail(w, label: L("5 hours", "5 Stunden")))) }
+        if let w = sevenDay { items.append(infoItem(detail(w, label: L("7 days", "7 Tage")))) }
         if let f = fetched { items.append(infoItem(L("Updated", "Aktualisiert") + " \(fmtTime(f))")) }
         if fetching { items.append(infoItem(L("Loading usage…", "Nutzung wird geladen…"))) }
         else if let e = lastError { items.append(infoItem(e)) }
@@ -396,7 +407,7 @@ private enum CodexUsage {
             }
         }
 
-        try send(#"{"id":1,"method":"initialize","params":{"clientInfo":{"name":"ai_usage_bar","title":"AIUsageBar","version":"0.1"}}}"#)
+        try send(#"{"id":1,"method":"initialize","params":{"clientInfo":{"name":"ai_usage_bar","title":"AIUsageBar","version":"0.2"}}}"#)
         _ = try reply(to: 1)
         try send(#"{"method":"initialized"}"#)
         try send(#"{"id":2,"method":"account/read","params":{"refreshToken":false}}"#)
@@ -542,6 +553,7 @@ func renderBar(_ segments: [(String, String)]) -> NSImage {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let providers: [UsageProvider] = [ClaudeProvider(), ChatGPTProvider()]
+    private var showMenuWhenHidden = false
 
     func isEnabled(_ p: UsageProvider) -> Bool {
         UserDefaults.standard.object(forKey: "enabled.\(p.id)") as? Bool ?? true
@@ -564,6 +576,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         tick()
     }
 
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !item.isVisible {
+            showMenuWhenHidden = true
+            render()
+        }
+        return false
+    }
+
     func tick() {
         for p in providers where isEnabled(p) { p.tick { [weak self] in self?.render() } }
         render()
@@ -572,15 +592,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func render() {
         let visible = providers.filter { isEnabled($0) && $0.shouldShow }
         let anyEnabled = providers.contains(where: isEnabled)
-        if visible.isEmpty && anyEnabled {
+        if !visible.isEmpty { showMenuWhenHidden = false }
+        if visible.isEmpty && anyEnabled && !showMenuWhenHidden {
             if item.isVisible { item.isVisible = false }
             return
         }
         if !item.isVisible { item.isVisible = true }
-        // Nothing enabled: keep a placeholder so the menu stays reachable
+        // Keep the menu reachable when the user reopens the app or disables every service.
         let segments = visible.isEmpty ? [("AI", "–")] : visible.map { ($0.name, $0.valueText) }
         item.button?.image = renderBar(segments)
-        item.button?.toolTip = visible.isEmpty ? L("AIUsageBar: no service enabled", "AIUsageBar: kein Dienst aktiviert") : visible.map(\.tooltip).joined(separator: "\n")
+        if visible.isEmpty {
+            item.button?.toolTip = anyEnabled ? "AIUsageBar" : L("AIUsageBar: no service enabled", "AIUsageBar: kein Dienst aktiviert")
+        } else {
+            item.button?.toolTip = visible.map(\.tooltip).joined(separator: "\n")
+        }
     }
 
     // Menu is rebuilt each time it opens

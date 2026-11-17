@@ -9,11 +9,12 @@ A tiny macOS menu bar app that shows how much of your **Claude and ChatGPT (Code
 - **No extra login.** It uses your existing Claude and ChatGPT desktop sign-ins.
 - **Only there when you need it.** Each indicator appears while its app has an open window (including minimised, hidden or on another Space). You can also show it when the app is running without an open window.
 - **Click for details.** See usage and reset times for the available limits, refresh the data, open the usage dashboards or enable launch at login.
+- **Get back to settings.** If the menu bar item hides, reopen `AIUsageBar.app` in Finder to bring back the AI menu.
 - **Native and light.** One Swift file, Apple frameworks only, no dependencies. Menu in English or German, following your system language.
 
 ## Requirements
 
-- macOS 14 or later (built and tested on macOS 27, Apple Silicon)
+- macOS 14 or later. The release ZIP is built for Apple Silicon.
 - For Claude usage, the [Claude desktop app](https://claude.ai/download) with an active sign-in
 - For Codex usage, the [ChatGPT desktop app](https://chatgpt.com/download/) with Codex and an active ChatGPT sign-in
 - For building: Xcode Command Line Tools (`xcode-select --install`)
@@ -35,6 +36,8 @@ cd AIUsageBar
 ```
 
 This compiles `main.swift`, creates `AIUsageBar.app` in the same folder, signs it ad hoc and starts it. New menu bar items appear on the left; hold ⌘ and drag to move it.
+
+Use `./build.sh --build-only` to build and sign the app without restarting it.
 
 ## How it works
 

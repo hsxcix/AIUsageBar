@@ -1,10 +1,11 @@
 #!/bin/zsh
-# Builds AIUsageBar.app next to this script and (re)starts it.
+# Builds AIUsageBar.app next to this script. Pass --build-only to skip launching it.
 set -e
 cd "${0:A:h}"
 APP=AIUsageBar.app
+MIN_MACOS=14.0
 mkdir -p $APP/Contents/MacOS
-cat > $APP/Contents/Info.plist <<'EOF'
+cat > $APP/Contents/Info.plist <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -12,14 +13,18 @@ cat > $APP/Contents/Info.plist <<'EOF'
   <key>CFBundleName</key><string>AIUsageBar</string>
   <key>CFBundleExecutable</key><string>AIUsageBar</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.1</string>
-  <key>CFBundleVersion</key><string>1</string>
-  <key>LSMinimumSystemVersion</key><string>14.0</string>
+  <key>CFBundleShortVersionString</key><string>0.2</string>
+  <key>CFBundleVersion</key><string>2</string>
+  <key>LSMinimumSystemVersion</key><string>$MIN_MACOS</string>
   <key>LSUIElement</key><true/>
 </dict></plist>
 EOF
-swiftc -O main.swift -o $APP/Contents/MacOS/AIUsageBar
+swiftc -O -target "$(uname -m)-apple-macos$MIN_MACOS" main.swift -o $APP/Contents/MacOS/AIUsageBar
 codesign --force --sign - $APP
+if [[ ${1:-} == --build-only ]]; then
+  echo "Built $PWD/$APP"
+  exit 0
+fi
 pkill -x AIUsageBar 2>/dev/null || true
 sleep 0.5
 open $APP
