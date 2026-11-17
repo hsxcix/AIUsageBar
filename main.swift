@@ -93,16 +93,17 @@ final class ClaudeAuth {
 
     private func loadKey() throws -> Data {
         if let k = aesKey { return k }
-        // /usr/bin/security is already trusted for this item, so no keychain prompt per rebuild.
+        // Use the system tool so macOS can apply the item's existing Keychain permissions.
         let p = Process()
         p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
         p.arguments = ["find-generic-password", "-s", "Claude Safe Storage", "-w"]
         let pipe = Pipe()
         p.standardOutput = pipe
-        p.standardError = Pipe()
+        p.standardError = FileHandle.nullDevice
         try p.run()
+        let output = pipe.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
-        let pw = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)?
+        let pw = String(data: output, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard p.terminationStatus == 0, !pw.isEmpty else { throw AuthError.noKey }
         var key = Data(count: 16)
@@ -143,9 +144,14 @@ final class ClaudeAuth {
               let cfg = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { throw AuthError.noConfig }
         let raw = (cfg["oauth:tokenCacheV2"] as? String) ?? (cfg["oauth:tokenCache"] as? String)
         guard let b64 = raw, let blob = Data(base64Encoded: b64) else { throw AuthError.noToken }
+        let hadCachedKey = aesKey != nil
+        let key = try loadKey()
         let plain: Data
-        do { plain = try decrypt(blob, key: try loadKey()) }
-        catch { aesKey = nil; plain = try decrypt(blob, key: try loadKey()) } // key may have changed
+        do { plain = try decrypt(blob, key: key) }
+        catch where hadCachedKey {
+            aesKey = nil
+            plain = try decrypt(blob, key: try loadKey())
+        }
         guard let cache = try JSONSerialization.jsonObject(with: plain) as? [String: [String: Any]] else { throw AuthError.noToken }
         let now = Date().timeIntervalSince1970 * 1000
         let valid = cache.values.compactMap { e -> (String, Double)? in
@@ -205,15 +211,23 @@ final class ClaudeProvider: UsageProvider {
         guard !fetching else { return }
         fetching = true
         lastAttempt = Date()
-        let tokens: [String]
-        do { tokens = try auth.tokens() } catch {
-            fetching = false
-            lastError = (error as? AuthError) == .noToken
-                ? L("No valid token (open Claude)", "Kein gültiges Token (Claude öffnen)")
-                : L("Auth error", "Auth-Fehler") + ": \(error)"
-            changed(); return
+        // The Keychain may wait for user input. Keep that wait off the main thread.
+        DispatchQueue.global(qos: .utility).async { [auth, weak self] in
+            let result = Result { try auth.tokens() }
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                switch result {
+                case .success(let tokens):
+                    self.attempt(tokens[...], changed)
+                case .failure(let error):
+                    self.fetching = false
+                    self.lastError = (error as? AuthError) == .noToken
+                        ? L("No valid token (open Claude)", "Kein gültiges Token (Claude öffnen)")
+                        : L("Auth error", "Auth-Fehler") + ": \(error)"
+                    changed()
+                }
+            }
         }
-        attempt(tokens[...], changed)
     }
 
     private func attempt(_ tokens: ArraySlice<String>, _ changed: @escaping () -> Void) {
@@ -261,7 +275,8 @@ final class ClaudeProvider: UsageProvider {
         if let w = fiveHour { items.append(infoItem(L("5 hours", "5 Stunden") + ": \(Int(w.pct.rounded())) %  ·  Reset \(fmtTime(w.resetsAt))")) }
         if let w = sevenDay { items.append(infoItem(L("7 days", "7 Tage") + ": \(Int(w.pct.rounded())) %  ·  Reset \(fmtTime(w.resetsAt))")) }
         if let f = fetched { items.append(infoItem(L("Updated", "Aktualisiert") + " \(fmtTime(f))")) }
-        if let e = lastError { items.append(infoItem(e)) }
+        if fetching { items.append(infoItem(L("Loading usage…", "Nutzung wird geladen…"))) }
+        else if let e = lastError { items.append(infoItem(e)) }
         items.append(ActionItem(L("Open usage on claude.ai", "Nutzung auf claude.ai öffnen")) {
             NSWorkspace.shared.open(URL(string: "https://claude.ai/settings/usage")!)
         })
