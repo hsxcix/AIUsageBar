@@ -1,20 +1,21 @@
 # AIUsageBar
 
-A tiny macOS menu bar app that shows how much of your **Claude 5-hour usage limit** you have used, styled like the two-line indicators of [Stats](https://github.com/exelban/stats).
+A tiny macOS menu bar app that shows how much of your **Claude and ChatGPT (Codex) usage limits** you have used, styled like the two-line indicators of [Stats](https://github.com/exelban/stats).
 
 ![AIUsageBar next to a Stats-style CPU indicator](docs/preview.png)
 
 *Rendered mock-up: the Claude tile next to a Stats-style CPU tile.*
 
-- **No extra login.** It reuses the session of the Claude desktop app you are already signed in to.
-- **Only there when you need it.** The indicator appears while a Claude window is open (minimised, hidden or on another Space counts too) and disappears when you close it. This can be turned off.
-- **Click for details:** 5-hour and 7-day usage with reset times, refresh, link to claude.ai usage, launch at login.
+- **No extra login.** It uses your existing Claude and ChatGPT desktop sign-ins.
+- **Only there when you need it.** Each indicator appears while its app has an open window (including minimised, hidden or on another Space). You can also show it when the app is running without an open window.
+- **Click for details.** See usage and reset times for the available limits, refresh the data, open the usage dashboards or enable launch at login.
 - **Native and light.** One Swift file, Apple frameworks only, no dependencies. Menu in English or German, following your system language.
 
 ## Requirements
 
 - macOS 14 or later (built and tested on macOS 27, Apple Silicon)
-- The [Claude desktop app](https://claude.ai/download), signed in
+- For Claude usage, the [Claude desktop app](https://claude.ai/download) with an active sign-in
+- For Codex usage, the [ChatGPT desktop app](https://chatgpt.com/download/) with Codex and an active ChatGPT sign-in
 - For building: Xcode Command Line Tools (`xcode-select --install`)
 
 ## Install
@@ -35,7 +36,9 @@ cd AIUsageBar
 
 This compiles `main.swift`, creates `AIUsageBar.app` in the same folder, signs it ad hoc and starts it. New menu bar items appear on the left; hold ⌘ and drag to move it.
 
-## How it works (please read)
+## How it works
+
+### Claude
 
 AIUsageBar does **not** ask for your password or have its own login. Instead it borrows the token the Claude desktop app has already stored:
 
@@ -44,9 +47,13 @@ AIUsageBar does **not** ask for your password or have its own login. Instead it 
 3. It decrypts the token locally (PBKDF2 + AES-128-CBC, the standard Chromium scheme) and calls `https://api.anthropic.com/api/oauth/usage`, the same endpoint Claude Code's `/usage` command uses.
 4. It **never refreshes** the token, because that would invalidate the desktop app's copy. The desktop app keeps it fresh while it is running.
 
-The token is only held in memory and only sent to `api.anthropic.com`. There is no analytics, no other network traffic, and nothing is written to disk except the app's own preferences.
+The Claude token is held in memory and sent only to `api.anthropic.com`.
 
 **Caveats:** the usage endpoint and the desktop app's storage format are not public APIs. Anthropic can change either at any time, which would break this app until it is updated. This project is not affiliated with or endorsed by Anthropic.
+
+### ChatGPT (Codex)
+
+AIUsageBar runs the Codex helper bundled with the ChatGPT desktop app and requests the account's Codex limits over its local App Server protocol. The helper uses your existing sign-in and manages its own credentials. The menu shows the available quota windows, such as 5 hours and 7 days, with their reset times. [OpenAI App Server documentation](https://learn.chatgpt.com/docs/app-server#6-rate-limits-chatgpt)
 
 ## Adding other services
 

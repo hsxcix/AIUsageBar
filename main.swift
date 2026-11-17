@@ -1,5 +1,5 @@
-// AIUsageBar: menu bar indicator for AI usage limits (currently: Claude 5h limit).
-// Each service is a UsageProvider; to add one (ChatGPT, DeepSeek, ...) implement the
+// AIUsageBar: menu bar indicator for Claude and ChatGPT (Codex) usage limits.
+// Each service is a UsageProvider; to add one implement the
 // protocol and append it to `providers` in AppDelegate.
 //
 // Claude auth: reuses the Claude desktop app's cached OAuth token (config.json, encrypted
@@ -8,6 +8,7 @@
 
 import AppKit
 import CommonCrypto
+import Darwin
 import ServiceManagement
 
 // MARK: - Provider protocol
@@ -56,6 +57,30 @@ func fmtTime(_ d: Date?) -> String {
     f.locale = Locale.current
     f.dateFormat = Calendar.current.isDateInToday(d) ? "HH:mm" : "EE HH:mm"
     return f.string(from: d)
+}
+
+final class AppWindowVisibility {
+    private var seenOnscreen = Set<Int>()
+
+    func isVisible(bundleID: String, includeWithoutWindow: Bool) -> Bool {
+        let pids = Set(NSWorkspace.shared.runningApplications.filter { $0.bundleIdentifier == bundleID }.map { $0.processIdentifier })
+        guard !pids.isEmpty else { seenOnscreen.removeAll(); return false }
+        if includeWithoutWindow { return true }
+        guard let list = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] else { return false }
+        var existing = Set<Int>()
+        for w in list {
+            guard let pid = w[kCGWindowOwnerPID as String] as? Int32, pids.contains(pid),
+                  (w[kCGWindowLayer as String] as? Int) == 0,
+                  let num = w[kCGWindowNumber as String] as? Int,
+                  let b = w[kCGWindowBounds as String] as? [String: CGFloat],
+                  (b["Width"] ?? 0) >= 300, (b["Height"] ?? 0) >= 200 else { continue }
+            existing.insert(num)
+            if (w[kCGWindowIsOnscreen as String] as? Bool) == true { seenOnscreen.insert(num) }
+        }
+        // Keep counting windows that are minimised, hidden or on another Space.
+        seenOnscreen.formIntersection(existing)
+        return !seenOnscreen.isEmpty
+    }
 }
 
 // MARK: - Claude
@@ -149,7 +174,7 @@ final class ClaudeProvider: UsageProvider {
     private var lastAttempt: Date = .distantPast
     private var backoffUntil: Date = .distantPast
     private var fetching = false
-    private var seenOnscreen = Set<Int>()   // Claude windows seen on screen at least once
+    private let visibility = AppWindowVisibility()
     private(set) var shouldShow = false
 
     private var alwaysShow: Bool {
@@ -168,30 +193,8 @@ final class ClaudeProvider: UsageProvider {
         return L("Claude 5h limit", "Claude 5h-Limit") + ": \(Int(w.pct.rounded())) %" + (lastError.map { "\n\($0)" } ?? "")
     }
 
-    private func windowOpen() -> Bool {
-        let pids = Set(NSWorkspace.shared.runningApplications.filter { $0.bundleIdentifier == bundleID }.map { $0.processIdentifier })
-        guard !pids.isEmpty else { seenOnscreen.removeAll(); return false }
-        if alwaysShow { return true }
-        guard let list = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] else { return false }
-        var existing = Set<Int>()
-        var open = false
-        for w in list {
-            guard let pid = w[kCGWindowOwnerPID as String] as? Int32, pids.contains(pid),
-                  (w[kCGWindowLayer as String] as? Int) == 0,
-                  let num = w[kCGWindowNumber as String] as? Int,
-                  let b = w[kCGWindowBounds as String] as? [String: CGFloat],
-                  (b["Width"] ?? 0) >= 300, (b["Height"] ?? 0) >= 200 else { continue }
-            existing.insert(num)
-            if (w[kCGWindowIsOnscreen as String] as? Bool) == true { seenOnscreen.insert(num) }
-            // On screen now, or seen before and still alive (minimised / hidden / other Space)
-            if seenOnscreen.contains(num) { open = true }
-        }
-        seenOnscreen.formIntersection(existing)
-        return open
-    }
-
     func tick(changed: @escaping () -> Void) {
-        shouldShow = windowOpen()
+        shouldShow = visibility.isVisible(bundleID: bundleID, includeWithoutWindow: alwaysShow)
         guard shouldShow else { return }
         if Date().timeIntervalSince(lastAttempt) >= pollInterval, Date() >= backoffUntil { fetch(changed) }
     }
@@ -270,6 +273,223 @@ final class ClaudeProvider: UsageProvider {
     }
 }
 
+// MARK: - ChatGPT
+
+private struct CodexLimit: Decodable {
+    let usedPercent: Int
+    let windowDurationMins: Int?
+    let resetsAt: Date?
+
+    var durationText: String? {
+        guard let windowDurationMins, windowDurationMins > 0 else { return nil }
+        let formatter = DateComponentsFormatter()
+        formatter.allowedUnits = [.day, .hour, .minute]
+        formatter.unitsStyle = .full
+        return formatter.string(from: Double(windowDurationMins) * 60)
+    }
+}
+
+private enum CodexUsage {
+    static let appID = "com.openai.codex"
+
+    enum FetchError: Error {
+        case appUnavailable, signInRequired, noLimits, timedOut, invalidResponse
+
+        var menuText: String {
+            switch self {
+            case .appUnavailable: return L("ChatGPT app with Codex not found", "ChatGPT-App mit Codex nicht gefunden")
+            case .signInRequired: return L("Sign in to the ChatGPT app", "In der ChatGPT-App anmelden")
+            case .noLimits: return L("No Codex limits available", "Keine Codex-Limits verfügbar")
+            case .timedOut: return L("Codex did not respond in time", "Codex hat nicht rechtzeitig geantwortet")
+            case .invalidResponse: return L("Could not load Codex usage", "Codex-Nutzung konnte nicht geladen werden")
+            }
+        }
+    }
+
+    private struct LimitsResponse: Decodable {
+        struct Snapshot: Decodable {
+            let primary: CodexLimit?
+            let secondary: CodexLimit?
+        }
+
+        struct RateLimits: Decodable {
+            let rateLimits: Snapshot
+            let rateLimitsByLimitId: [String: Snapshot]?
+        }
+
+        let result: RateLimits
+    }
+
+    static func executableURL() -> URL? {
+        let workspace = NSWorkspace.shared
+        let app = workspace.runningApplications.first { $0.bundleIdentifier == appID }?.bundleURL
+            ?? workspace.urlForApplication(withBundleIdentifier: appID)
+        let executable = app?.appendingPathComponent("Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex")
+        return executable.flatMap { FileManager.default.isExecutableFile(atPath: $0.path) ? $0 : nil }
+    }
+
+    static func fetch(executable: URL) throws -> [CodexLimit] {
+        let process = Process()
+        let input = Pipe()
+        let output = Pipe()
+        process.executableURL = executable
+        process.arguments = ["app-server", "-c", "analytics.enabled=false"]
+        process.currentDirectoryURL = FileManager.default.homeDirectoryForCurrentUser
+        process.standardInput = input
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        // A helper that exits between requests should raise an I/O error instead of SIGPIPE.
+        guard fcntl(input.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1) != -1 else {
+            throw FetchError.invalidResponse
+        }
+        try process.run()
+        defer {
+            try? input.fileHandleForWriting.close()
+            if process.isRunning { process.terminate() }
+        }
+
+        // App Server uses one JSON message per line over stdio. Only keep replies to our requests.
+        var buffer = Data()
+        let fd = output.fileHandleForReading.fileDescriptor
+        let deadline = ProcessInfo.processInfo.systemUptime + 15
+
+        func send(_ line: String) throws {
+            try input.fileHandleForWriting.write(contentsOf: Data((line + "\n").utf8))
+        }
+
+        func reply(to id: Int) throws -> (Data, [String: Any]) {
+            while true {
+                while let newline = buffer.firstIndex(of: 0x0A) {
+                    let line = buffer.prefix(upTo: newline)
+                    buffer.removeSubrange(...newline)
+                    guard let message = try JSONSerialization.jsonObject(with: line) as? [String: Any],
+                          message["id"] as? Int == id else { continue }
+                    guard let result = message["result"] as? [String: Any] else { throw FetchError.invalidResponse }
+                    return (line, result)
+                }
+
+                let remaining = deadline - ProcessInfo.processInfo.systemUptime
+                guard remaining > 0 else { throw FetchError.timedOut }
+                var ready = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+                let status = poll(&ready, 1, Int32((remaining * 1000).rounded(.up)))
+                if status < 0 && errno == EINTR { continue }
+                guard status != 0 else { throw FetchError.timedOut }
+                guard status > 0 else { throw FetchError.invalidResponse }
+                let chunk = output.fileHandleForReading.availableData
+                guard !chunk.isEmpty, buffer.count + chunk.count <= 1_048_576 else { throw FetchError.invalidResponse }
+                buffer.append(chunk)
+            }
+        }
+
+        try send(#"{"id":1,"method":"initialize","params":{"clientInfo":{"name":"ai_usage_bar","title":"AIUsageBar","version":"0.1"}}}"#)
+        _ = try reply(to: 1)
+        try send(#"{"method":"initialized"}"#)
+        try send(#"{"id":2,"method":"account/read","params":{"refreshToken":false}}"#)
+        let (_, state) = try reply(to: 2)
+        let account = state["account"] as? [String: Any]
+        guard account?["type"] as? String == "chatgpt" else { throw FetchError.signInRequired }
+        try send(#"{"id":3,"method":"account/rateLimits/read"}"#)
+        let (data, _) = try reply(to: 3)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .secondsSince1970
+        let response = try decoder.decode(LimitsResponse.self, from: data).result
+        let snapshot = response.rateLimitsByLimitId?["codex"] ?? response.rateLimits
+        let limits = [snapshot.primary, snapshot.secondary].compactMap { $0 }
+        guard !limits.isEmpty else { throw FetchError.noLimits }
+        return limits
+    }
+}
+
+final class ChatGPTProvider: UsageProvider {
+    let id = "chatgpt"
+    let name = "ChatGPT"
+    private let visibility = AppWindowVisibility()
+    private var limits: [CodexLimit] = []
+    private var fetched: Date?
+    private var lastError: String?
+    private var lastAttempt: Date = .distantPast
+    private var fetching = false
+    private(set) var shouldShow = false
+
+    private var alwaysShow: Bool {
+        get { UserDefaults.standard.bool(forKey: "chatgpt.alwaysShow") }
+        set { UserDefaults.standard.set(newValue, forKey: "chatgpt.alwaysShow") }
+    }
+
+    var valueText: String {
+        guard let limit = limits.first, limit.resetsAt.map({ $0 > Date() }) ?? true else { return "–" }
+        return "\(limit.usedPercent)%"
+    }
+
+    var tooltip: String {
+        let rows = [L("ChatGPT (Codex limits)", "ChatGPT (Codex-Limits)")] + limits.map(detail)
+        return (rows + [lastError].compactMap { $0 }).joined(separator: "\n")
+    }
+
+    func tick(changed: @escaping () -> Void) {
+        shouldShow = visibility.isVisible(bundleID: CodexUsage.appID, includeWithoutWindow: alwaysShow)
+        if shouldShow, Date().timeIntervalSince(lastAttempt) >= 120 {
+            refreshNow(changed: changed)
+        }
+    }
+
+    func refreshNow(changed: @escaping () -> Void) {
+        guard !fetching else { return }
+        lastAttempt = Date()
+        guard let executable = CodexUsage.executableURL() else {
+            lastError = CodexUsage.FetchError.appUnavailable.menuText
+            changed()
+            return
+        }
+        fetching = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let result = Result { try CodexUsage.fetch(executable: executable) }
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.fetching = false
+                switch result {
+                case .success(let limits):
+                    self.limits = limits
+                    self.fetched = Date()
+                    self.lastError = nil
+                case .failure(let error):
+                    let failure = error as? CodexUsage.FetchError ?? .invalidResponse
+                    if failure == .signInRequired || failure == .noLimits {
+                        self.limits = []
+                        self.fetched = nil
+                    }
+                    self.lastError = failure.menuText
+                }
+                changed()
+            }
+        }
+    }
+
+    private func detail(_ limit: CodexLimit) -> String {
+        let duration = limit.durationText ?? L("Usage", "Nutzung")
+        if let reset = limit.resetsAt, reset <= Date() {
+            return duration + " · " + L("Waiting for new usage data", "Warte auf neue Nutzungsdaten")
+        }
+        return "\(duration): \(limit.usedPercent) %" + (limit.resetsAt.map { "  ·  Reset " + fmtTime($0) } ?? "")
+    }
+
+    func menuItems(changed: @escaping () -> Void) -> [NSMenuItem] {
+        var items = [infoItem(L("Codex limits", "Codex-Limits"))]
+        items += limits.map { infoItem(detail($0)) }
+        if let fetched { items.append(infoItem(L("Updated", "Aktualisiert") + " " + fmtTime(fetched))) }
+        if let lastError { items.append(infoItem(lastError)) }
+        else if fetching { items.append(infoItem(L("Loading usage…", "Nutzung wird geladen…"))) }
+        items.append(ActionItem(L("Open Codex usage dashboard", "Codex-Nutzungsübersicht öffnen")) {
+            NSWorkspace.shared.open(URL(string: "https://chatgpt.com/codex/settings/usage")!)
+        })
+        items.append(ActionItem(L("Show even without an open ChatGPT window", "Auch ohne offenes ChatGPT-Fenster anzeigen"),
+                                state: alwaysShow ? .on : .off) { [weak self] in
+            self?.alwaysShow.toggle(); self?.tick(changed: changed); changed()
+        })
+        return items
+    }
+}
+
 // MARK: - Rendering (Stats-style: small label on top, value below)
 
 // Slightly bolder than Stats (regular label, medium value), vertically centred.
@@ -306,7 +526,7 @@ func renderBar(_ segments: [(String, String)]) -> NSImage {
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-    let providers: [UsageProvider] = [ClaudeProvider()]
+    let providers: [UsageProvider] = [ClaudeProvider(), ChatGPTProvider()]
 
     func isEnabled(_ p: UsageProvider) -> Bool {
         UserDefaults.standard.object(forKey: "enabled.\(p.id)") as? Bool ?? true
