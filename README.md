@@ -6,10 +6,9 @@ A tiny macOS menu bar app that shows how much of your **Claude and ChatGPT (Code
 
 *Rendered mock-up: the Claude tile next to a Stats-style CPU tile.*
 
-- **No extra login.** It uses your existing Claude and ChatGPT desktop sign-ins.
-- **Only there when you need it.** Each indicator appears while its app has an open window (including minimised, hidden or on another Space). You can also show it when the app is running without an open window.
+- **No extra login.** It uses your existing Claude desktop (or Claude Code) and ChatGPT desktop sign-ins.
+- **Always in view, light on resources.** Each enabled service is always shown. Claude refreshes every 2 minutes, ChatGPT every 10 minutes and whenever you open the menu. Polling pauses while the display is off. Values from a failed or overdue refresh are dimmed.
 - **Click for details.** See usage and reset times for the available limits, refresh the data, open the usage dashboards or enable launch at login.
-- **Get back to settings.** If the menu bar item hides, reopen `AIUsageBar.app` in Finder to bring back the AI menu.
 - **Native and light.** One Swift file, Apple frameworks only, no dependencies. Menu in English or German, following your system language.
 
 ## Requirements
@@ -48,7 +47,8 @@ AIUsageBar does **not** ask for your password or have its own login. Instead it 
 1. The Claude desktop app (Electron) keeps its OAuth tokens in `~/Library/Application Support/Claude/config.json`, encrypted with Electron's `safeStorage`.
 2. AIUsageBar reads the decryption password from the macOS keychain item **"Claude Safe Storage"** using Apple's `/usr/bin/security` tool. macOS may ask you once to allow this.
 3. It decrypts the token locally (PBKDF2 + AES-128-CBC, the standard Chromium scheme) and calls `https://api.anthropic.com/api/oauth/usage`, the same endpoint Claude Code's `/usage` command uses.
-4. It **never refreshes** the token, because that would invalidate the desktop app's copy. The desktop app keeps it fresh while it is running.
+4. If the desktop app has no valid token, it falls back to the token Claude Code keeps in the keychain item **"Claude Code-credentials"** (again via `/usr/bin/security`).
+5. It **never refreshes** either token, because that would invalidate the owning app's copy. Each app keeps its token fresh while it is running, so after a long break the indicator may show "No valid token" until you open Claude or Claude Code again. After a failed sign-in it waits 15 minutes before trying again, or refreshes right away when the Claude app starts or you choose **Refresh now**.
 
 The Claude token is held in memory and sent only to `api.anthropic.com`.
 
@@ -57,6 +57,15 @@ The Claude token is held in memory and sent only to `api.anthropic.com`.
 ### ChatGPT (Codex)
 
 AIUsageBar runs the Codex helper bundled with the ChatGPT desktop app and requests the account's Codex limits over its local App Server protocol. The helper uses your existing sign-in and manages its own credentials. The menu shows the available quota windows, such as 5 hours and 7 days, with their reset times. [OpenAI App Server documentation](https://learn.chatgpt.com/docs/app-server#6-rate-limits-chatgpt)
+
+## Testing
+
+Environment variables for testing without real requests (run the binary directly, e.g. `AIUsageBar.app/Contents/MacOS/AIUsageBar`):
+
+- `AIUSAGEBAR_DEBUG=1` prints fetch results and pauses to stdout.
+- `AIUSAGEBAR_USAGE_URL=http://127.0.0.1:8000/` sends Claude requests to a local server instead.
+- `AIUSAGEBAR_FAKE_TOKEN=test` uses this token instead of reading the keychain.
+- `AIUSAGEBAR_CLAUDE_SOURCE=desktop` or `claudecode` restricts Claude to one token source.
 
 ## Adding other services
 

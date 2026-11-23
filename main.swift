@@ -1,10 +1,12 @@
 // AIUsageBar: menu bar indicator for Claude and ChatGPT (Codex) usage limits.
+// Indicators are always shown; polling pauses while the display is off.
 // Each service is a UsageProvider; to add one implement the
 // protocol and append it to `providers` in AppDelegate.
 //
 // Claude auth: reuses the Claude desktop app's cached OAuth token (config.json, encrypted
-// with Electron safeStorage; key from the "Claude Safe Storage" keychain item).
-// The token is never refreshed here (that would rotate it away from the desktop app).
+// with Electron safeStorage; key from the "Claude Safe Storage" keychain item), falling back
+// to Claude Code's token ("Claude Code-credentials" keychain item).
+// Tokens are never refreshed here (that would rotate it away from the desktop app).
 
 import AppKit
 import CommonCrypto
@@ -16,16 +18,23 @@ import ServiceManagement
 protocol UsageProvider: AnyObject {
     var id: String { get }
     var name: String { get }
-    /// Whether the provider's segment should currently appear in the menu bar.
-    var shouldShow: Bool { get }
+    /// Bundle IDs of apps whose launch should trigger a fresh fetch (their sign-in may just have been refreshed).
+    var appBundleIDs: [String] { get }
     /// Short value under the label, e.g. "7%".
     var valueText: String { get }
+    /// The value comes from a failed or overdue fetch; it is drawn dimmed.
+    var isStale: Bool { get }
     var tooltip: String { get }
-    /// Called every few seconds; update visibility state and fetch if due. Call `changed` after async updates.
+    /// Called periodically while the display is on; fetch if due. Call `changed` after async updates.
     func tick(changed: @escaping () -> Void)
+    /// The menu opened: fetch unless the last attempt was very recent.
+    func menuOpened(changed: @escaping () -> Void)
+    /// Fetch now, ignoring interval and backoff.
     func refreshNow(changed: @escaping () -> Void)
-    /// Detail rows and actions for the menu (shown indented under the provider's toggle).
-    func menuItems(changed: @escaping () -> Void) -> [NSMenuItem]
+    /// Detail rows under the provider's toggle; read again when data changes while the menu is open.
+    func infoLines() -> [String]
+    /// Actions shown after the detail rows.
+    func actionItems() -> [NSMenuItem]
 }
 
 /// NSMenuItem that runs a closure.
@@ -59,28 +68,27 @@ func fmtTime(_ d: Date?) -> String {
     return f.string(from: d)
 }
 
-final class AppWindowVisibility {
-    private var seenOnscreen = Set<Int>()
+/// Debug overrides for testing without real requests, see README.
+let env = ProcessInfo.processInfo.environment
+func debugLog(_ s: String) {
+    guard env["AIUSAGEBAR_DEBUG"] != nil else { return }
+    print("[\(fmtTime(Date()))] \(s)")
+    fflush(stdout)
+}
 
-    func isVisible(bundleID: String, includeWithoutWindow: Bool) -> Bool {
-        let pids = Set(NSWorkspace.shared.runningApplications.filter { $0.bundleIdentifier == bundleID }.map { $0.processIdentifier })
-        guard !pids.isEmpty else { seenOnscreen.removeAll(); return false }
-        if includeWithoutWindow { return true }
-        guard let list = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] else { return false }
-        var existing = Set<Int>()
-        for w in list {
-            guard let pid = w[kCGWindowOwnerPID as String] as? Int32, pids.contains(pid),
-                  (w[kCGWindowLayer as String] as? Int) == 0,
-                  let num = w[kCGWindowNumber as String] as? Int,
-                  let b = w[kCGWindowBounds as String] as? [String: CGFloat],
-                  (b["Width"] ?? 0) >= 300, (b["Height"] ?? 0) >= 200 else { continue }
-            existing.insert(num)
-            if (w[kCGWindowIsOnscreen as String] as? Bool) == true { seenOnscreen.insert(num) }
-        }
-        // Keep counting windows that are minimised, hidden or on another Space.
-        seenOnscreen.formIntersection(existing)
-        return !seenOnscreen.isEmpty
-    }
+/// Reads a generic password through the system tool, so macOS applies the item's existing Keychain permissions.
+func keychainPassword(service: String) -> String? {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+    p.arguments = ["find-generic-password", "-s", service, "-w"]
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = FileHandle.nullDevice
+    guard (try? p.run()) != nil else { return nil }
+    let output = pipe.fileHandleForReading.readDataToEndOfFile()
+    p.waitUntilExit()
+    let pw = String(data: output, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    return p.terminationStatus == 0 && !pw.isEmpty ? pw : nil
 }
 
 // MARK: - Claude
@@ -93,19 +101,7 @@ final class ClaudeAuth {
 
     private func loadKey() throws -> Data {
         if let k = aesKey { return k }
-        // Use the system tool so macOS can apply the item's existing Keychain permissions.
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        p.arguments = ["find-generic-password", "-s", "Claude Safe Storage", "-w"]
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        p.standardError = FileHandle.nullDevice
-        try p.run()
-        let output = pipe.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        let pw = String(data: output, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard p.terminationStatus == 0, !pw.isEmpty else { throw AuthError.noKey }
+        guard let pw = keychainPassword(service: "Claude Safe Storage") else { throw AuthError.noKey }
         var key = Data(count: 16)
         let salt = Array("saltysalt".utf8)
         let status = key.withUnsafeMutableBytes { kp in
@@ -163,6 +159,26 @@ final class ClaudeAuth {
     }
 }
 
+/// Fallback: the OAuth token Claude Code keeps in the Keychain. Read only, never refreshed (same rule as above).
+enum ClaudeCodeAuth {
+    /// Skip lookups for a while after the item is missing or access was denied, to avoid repeated Keychain prompts.
+    private static var unavailableUntil = Date.distantPast
+
+    static func token() -> String? {
+        guard Date() >= unavailableUntil else { return nil }
+        guard let pw = keychainPassword(service: "Claude Code-credentials"),
+              let j = try? JSONSerialization.jsonObject(with: Data(pw.utf8)) as? [String: Any],
+              let o = j["claudeAiOauth"] as? [String: Any],
+              let token = o["accessToken"] as? String else {
+            unavailableUntil = Date().addingTimeInterval(3600)
+            return nil
+        }
+        // An expired token is not marked unavailable: Claude Code refreshes it on its next run.
+        if let exp = o["expiresAt"] as? Double, exp <= Date().timeIntervalSince1970 * 1000 + 30_000 { return nil }
+        return token
+    }
+}
+
 struct LimitWindow {
     let pct: Double
     let resetsAt: Date?
@@ -173,9 +189,10 @@ struct LimitWindow {
 final class ClaudeProvider: UsageProvider {
     let id = "claude"
     let name = "Claude"
-    private let bundleID = "com.anthropic.claudefordesktop"
-    private let usageURL = URL(string: "https://api.anthropic.com/api/oauth/usage")!
+    let appBundleIDs = ["com.anthropic.claudefordesktop"]
+    private let usageURL = URL(string: env["AIUSAGEBAR_USAGE_URL"] ?? "https://api.anthropic.com/api/oauth/usage")!
     private let pollInterval: TimeInterval = 120
+    private let authBackoff: TimeInterval = 900
 
     private let auth = ClaudeAuth()
     private var fiveHour: LimitWindow?
@@ -185,17 +202,15 @@ final class ClaudeProvider: UsageProvider {
     private var lastAttempt: Date = .distantPast
     private var backoffUntil: Date = .distantPast
     private var fetching = false
-    private let visibility = AppWindowVisibility()
-    private(set) var shouldShow = false
-
-    private var alwaysShow: Bool {
-        get { UserDefaults.standard.bool(forKey: "claude.alwaysShow") }
-        set { UserDefaults.standard.set(newValue, forKey: "claude.alwaysShow") }
-    }
 
     var valueText: String {
         guard let window = fiveHour, !window.hasReset else { return "–" }
         return "\(Int(window.pct.rounded()))%"
+    }
+
+    var isStale: Bool {
+        guard let fetched, !fetching else { return false }
+        return lastError != nil || Date().timeIntervalSince(fetched) > 2 * pollInterval
     }
 
     var tooltip: String {
@@ -203,39 +218,47 @@ final class ClaudeProvider: UsageProvider {
         return detail(w, label: L("Claude 5h limit", "Claude 5h-Limit")) + (lastError.map { "\n\($0)" } ?? "")
     }
 
-    func tick(changed: @escaping () -> Void) {
-        shouldShow = visibility.isVisible(bundleID: bundleID, includeWithoutWindow: alwaysShow)
-        guard shouldShow else { return }
-        if Date().timeIntervalSince(lastAttempt) >= pollInterval, Date() >= backoffUntil { fetch(changed) }
+    private func due(after age: TimeInterval) -> Bool {
+        Date() >= backoffUntil && Date().timeIntervalSince(lastAttempt) >= age
     }
 
+    func tick(changed: @escaping () -> Void) { if due(after: pollInterval) { fetch(changed) } }
+    func menuOpened(changed: @escaping () -> Void) { if due(after: 60) { fetch(changed) } }
     func refreshNow(changed: @escaping () -> Void) { backoffUntil = .distantPast; fetch(changed) }
 
     private func fetch(_ changed: @escaping () -> Void) {
         guard !fetching else { return }
         fetching = true
         lastAttempt = Date()
+        changed()
+        let fake = env["AIUSAGEBAR_FAKE_TOKEN"]
+        let source = env["AIUSAGEBAR_CLAUDE_SOURCE"]
         // The Keychain may wait for user input. Keep that wait off the main thread.
         DispatchQueue.global(qos: .utility).async { [auth, weak self] in
-            let result = Result { try auth.tokens() }
+            let tokens = fake.map { [$0] } ?? (source == "claudecode" ? [] : ((try? auth.tokens()) ?? []))
             DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                switch result {
-                case .success(let tokens):
-                    self.attempt(tokens[...], changed)
-                case .failure(let error):
-                    self.fetching = false
-                    self.lastError = (error as? AuthError) == .noToken
-                        ? L("No valid token (open Claude)", "Kein gültiges Token (Claude öffnen)")
-                        : L("Auth error", "Auth-Fehler") + ": \(error)"
-                    changed()
-                }
+                self?.attempt(tokens[...], claudeCodeTried: fake != nil || source == "desktop", changed)
             }
         }
     }
 
-    private func attempt(_ tokens: ArraySlice<String>, _ changed: @escaping () -> Void) {
-        guard let token = tokens.first else { fetching = false; lastError = L("Token rejected", "Token abgelehnt"); changed(); return }
+    /// Tries the desktop app's tokens first, then Claude Code's.
+    private func attempt(_ tokens: ArraySlice<String>, claudeCodeTried: Bool, _ changed: @escaping () -> Void) {
+        guard let token = tokens.first else {
+            if !claudeCodeTried {
+                DispatchQueue.global(qos: .utility).async { [weak self] in
+                    let cc = ClaudeCodeAuth.token().map { [$0] } ?? []
+                    DispatchQueue.main.async { [weak self] in self?.attempt(cc[...], claudeCodeTried: true, changed) }
+                }
+                return
+            }
+            fetching = false
+            backoffUntil = Date().addingTimeInterval(authBackoff)
+            lastError = L("No valid token (open Claude or Claude Code)", "Kein gültiges Token (Claude oder Claude Code öffnen)")
+            debugLog("claude: no valid token, next try in \(Int(authBackoff / 60)) min")
+            changed()
+            return
+        }
         var req = URLRequest(url: usageURL, timeoutInterval: 15)
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         req.setValue("oauth-2025-04-20", forHTTPHeaderField: "anthropic-beta")
@@ -244,7 +267,8 @@ final class ClaudeProvider: UsageProvider {
             DispatchQueue.main.async {
                 guard let self else { return }
                 let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
-                if code == 401 || code == 403 { self.attempt(tokens.dropFirst(), changed); return }
+                debugLog("claude: HTTP \(code)")
+                if code == 401 || code == 403 { self.attempt(tokens.dropFirst(), claudeCodeTried: claudeCodeTried, changed); return }
                 self.fetching = false
                 if code == 429 {
                     self.backoffUntil = Date().addingTimeInterval(600)
@@ -281,21 +305,20 @@ final class ClaudeProvider: UsageProvider {
         return "\(label): \(Int(window.pct.rounded())) %  ·  Reset \(fmtTime(window.resetsAt))"
     }
 
-    func menuItems(changed: @escaping () -> Void) -> [NSMenuItem] {
-        var items: [NSMenuItem] = []
-        if let w = fiveHour { items.append(infoItem(detail(w, label: L("5 hours", "5 Stunden")))) }
-        if let w = sevenDay { items.append(infoItem(detail(w, label: L("7 days", "7 Tage")))) }
-        if let f = fetched { items.append(infoItem(L("Updated", "Aktualisiert") + " \(fmtTime(f))")) }
-        if fetching { items.append(infoItem(L("Loading usage…", "Nutzung wird geladen…"))) }
-        else if let e = lastError { items.append(infoItem(e)) }
-        items.append(ActionItem(L("Open usage on claude.ai", "Nutzung auf claude.ai öffnen")) {
+    func infoLines() -> [String] {
+        var rows: [String] = []
+        if let w = fiveHour { rows.append(detail(w, label: L("5 hours", "5 Stunden"))) }
+        if let w = sevenDay { rows.append(detail(w, label: L("7 days", "7 Tage"))) }
+        if let f = fetched { rows.append(L("Updated", "Aktualisiert") + " \(fmtTime(f))") }
+        if fetching { rows.append(L("Loading usage…", "Nutzung wird geladen…")) }
+        else if let e = lastError { rows.append(e) }
+        return rows
+    }
+
+    func actionItems() -> [NSMenuItem] {
+        [ActionItem(L("Open usage on claude.ai", "Nutzung auf claude.ai öffnen")) {
             NSWorkspace.shared.open(URL(string: "https://claude.ai/settings/usage")!)
-        })
-        items.append(ActionItem(L("Show even without an open Claude window", "Auch ohne offenes Claude-Fenster anzeigen"),
-                                state: alwaysShow ? .on : .off) { [weak self] in
-            self?.alwaysShow.toggle(); self?.tick(changed: changed); changed()
-        })
-        return items
+        }]
     }
 }
 
@@ -347,9 +370,7 @@ private enum CodexUsage {
     }
 
     static func executableURL() -> URL? {
-        let workspace = NSWorkspace.shared
-        let app = workspace.runningApplications.first { $0.bundleIdentifier == appID }?.bundleURL
-            ?? workspace.urlForApplication(withBundleIdentifier: appID)
+        let app = NSWorkspace.shared.urlForApplication(withBundleIdentifier: appID)
         let executable = app?.appendingPathComponent("Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex")
         return executable.flatMap { FileManager.default.isExecutableFile(atPath: $0.path) ? $0 : nil }
     }
@@ -407,7 +428,7 @@ private enum CodexUsage {
             }
         }
 
-        try send(#"{"id":1,"method":"initialize","params":{"clientInfo":{"name":"ai_usage_bar","title":"AIUsageBar","version":"0.2"}}}"#)
+        try send(#"{"id":1,"method":"initialize","params":{"clientInfo":{"name":"ai_usage_bar","title":"AIUsageBar","version":"0.3"}}}"#)
         _ = try reply(to: 1)
         try send(#"{"method":"initialized"}"#)
         try send(#"{"id":2,"method":"account/read","params":{"refreshToken":false}}"#)
@@ -429,22 +450,25 @@ private enum CodexUsage {
 final class ChatGPTProvider: UsageProvider {
     let id = "chatgpt"
     let name = "ChatGPT"
-    private let visibility = AppWindowVisibility()
+    let appBundleIDs = [CodexUsage.appID]
+    /// Each fetch starts the bundled Codex helper, so poll rarely and refresh when the menu opens.
+    private let pollInterval: TimeInterval = 600
+    private let setupBackoff: TimeInterval = 900
     private var limits: [CodexLimit] = []
     private var fetched: Date?
     private var lastError: String?
     private var lastAttempt: Date = .distantPast
+    private var backoffUntil: Date = .distantPast
     private var fetching = false
-    private(set) var shouldShow = false
-
-    private var alwaysShow: Bool {
-        get { UserDefaults.standard.bool(forKey: "chatgpt.alwaysShow") }
-        set { UserDefaults.standard.set(newValue, forKey: "chatgpt.alwaysShow") }
-    }
 
     var valueText: String {
         guard let limit = limits.first, limit.resetsAt.map({ $0 > Date() }) ?? true else { return "–" }
         return "\(limit.usedPercent)%"
+    }
+
+    var isStale: Bool {
+        guard let fetched, !fetching else { return false }
+        return lastError != nil || Date().timeIntervalSince(fetched) > 2 * pollInterval
     }
 
     var tooltip: String {
@@ -452,22 +476,25 @@ final class ChatGPTProvider: UsageProvider {
         return (rows + [lastError].compactMap { $0 }).joined(separator: "\n")
     }
 
-    func tick(changed: @escaping () -> Void) {
-        shouldShow = visibility.isVisible(bundleID: CodexUsage.appID, includeWithoutWindow: alwaysShow)
-        if shouldShow, Date().timeIntervalSince(lastAttempt) >= 120 {
-            refreshNow(changed: changed)
-        }
+    private func due(after age: TimeInterval) -> Bool {
+        Date() >= backoffUntil && Date().timeIntervalSince(lastAttempt) >= age
     }
 
-    func refreshNow(changed: @escaping () -> Void) {
+    func tick(changed: @escaping () -> Void) { if due(after: pollInterval) { fetch(changed) } }
+    func menuOpened(changed: @escaping () -> Void) { if due(after: 60) { fetch(changed) } }
+    func refreshNow(changed: @escaping () -> Void) { backoffUntil = .distantPast; fetch(changed) }
+
+    private func fetch(_ changed: @escaping () -> Void) {
         guard !fetching else { return }
         lastAttempt = Date()
         guard let executable = CodexUsage.executableURL() else {
             lastError = CodexUsage.FetchError.appUnavailable.menuText
+            backoffUntil = Date().addingTimeInterval(setupBackoff)
             changed()
             return
         }
         fetching = true
+        changed()
         DispatchQueue.global(qos: .utility).async { [weak self] in
             let result = Result { try CodexUsage.fetch(executable: executable) }
             DispatchQueue.main.async { [weak self] in
@@ -475,14 +502,17 @@ final class ChatGPTProvider: UsageProvider {
                 self.fetching = false
                 switch result {
                 case .success(let limits):
+                    debugLog("chatgpt: \(limits.count) limits")
                     self.limits = limits
                     self.fetched = Date()
                     self.lastError = nil
                 case .failure(let error):
                     let failure = error as? CodexUsage.FetchError ?? .invalidResponse
+                    debugLog("chatgpt: \(failure)")
                     if failure == .signInRequired || failure == .noLimits {
                         self.limits = []
                         self.fetched = nil
+                        self.backoffUntil = Date().addingTimeInterval(self.setupBackoff)
                     }
                     self.lastError = failure.menuText
                 }
@@ -499,20 +529,18 @@ final class ChatGPTProvider: UsageProvider {
         return "\(duration): \(limit.usedPercent) %" + (limit.resetsAt.map { "  ·  Reset " + fmtTime($0) } ?? "")
     }
 
-    func menuItems(changed: @escaping () -> Void) -> [NSMenuItem] {
-        var items = [infoItem(L("Codex limits", "Codex-Limits"))]
-        items += limits.map { infoItem(detail($0)) }
-        if let fetched { items.append(infoItem(L("Updated", "Aktualisiert") + " " + fmtTime(fetched))) }
-        if let lastError { items.append(infoItem(lastError)) }
-        else if fetching { items.append(infoItem(L("Loading usage…", "Nutzung wird geladen…"))) }
-        items.append(ActionItem(L("Open Codex usage dashboard", "Codex-Nutzungsübersicht öffnen")) {
+    func infoLines() -> [String] {
+        var rows = [L("Codex limits", "Codex-Limits")] + limits.map(detail)
+        if let fetched { rows.append(L("Updated", "Aktualisiert") + " " + fmtTime(fetched)) }
+        if fetching { rows.append(L("Loading usage…", "Nutzung wird geladen…")) }
+        else if let lastError { rows.append(lastError) }
+        return rows
+    }
+
+    func actionItems() -> [NSMenuItem] {
+        [ActionItem(L("Open Codex usage dashboard", "Codex-Nutzungsübersicht öffnen")) {
             NSWorkspace.shared.open(URL(string: "https://chatgpt.com/codex/settings/usage")!)
-        })
-        items.append(ActionItem(L("Show even without an open ChatGPT window", "Auch ohne offenes ChatGPT-Fenster anzeigen"),
-                                state: alwaysShow ? .on : .off) { [weak self] in
-            self?.alwaysShow.toggle(); self?.tick(changed: changed); changed()
-        })
-        return items
+        }]
     }
 }
 
@@ -534,14 +562,17 @@ func renderSegment(label: String, value: String) -> NSImage {
     }
 }
 
-/// Several segments side by side, as one template image.
-func renderBar(_ segments: [(String, String)]) -> NSImage {
-    let imgs = segments.map { renderSegment(label: $0.0, value: $0.1) }
+/// Several segments side by side, as one template image. Dimmed segments show stale values.
+func renderBar(_ segments: [(label: String, value: String, dimmed: Bool)]) -> NSImage {
+    let imgs = segments.map { (renderSegment(label: $0.label, value: $0.value), $0.dimmed) }
     let gap: CGFloat = 10
-    let width = imgs.reduce(0) { $0 + $1.size.width } + gap * CGFloat(max(imgs.count - 1, 0))
+    let width = imgs.reduce(0) { $0 + $1.0.size.width } + gap * CGFloat(max(imgs.count - 1, 0))
     let img = NSImage(size: NSSize(width: width, height: 22), flipped: false) { _ in
         var x: CGFloat = 0
-        for i in imgs { i.draw(at: NSPoint(x: x, y: 0), from: .zero, operation: .sourceOver, fraction: 1); x += i.size.width + gap }
+        for (i, dimmed) in imgs {
+            i.draw(at: NSPoint(x: x, y: 0), from: .zero, operation: .sourceOver, fraction: dimmed ? 0.4 : 1)
+            x += i.size.width + gap
+        }
         return true
     }
     img.isTemplate = true
@@ -553,7 +584,14 @@ func renderBar(_ segments: [(String, String)]) -> NSImage {
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let providers: [UsageProvider] = [ClaudeProvider(), ChatGPTProvider()]
-    private var showMenuWhenHidden = false
+    /// No polling while the display is off: nobody looks, and the Mac may stay awake all night on power.
+    private var displayAsleep = false
+    private var lastWakeRefresh = Date.distantPast
+    private var menuOpen = false
+    /// Toggles and detail rows of the open menu, per provider id, so data updates can replace rows in place.
+    private var toggles: [String: NSMenuItem] = [:]
+    private var infoRows: [String: [NSMenuItem]] = [:]
+    private lazy var changed: () -> Void = { [weak self] in self?.dataChanged() }
 
     func isEnabled(_ p: UsageProvider) -> Bool {
         UserDefaults.standard.object(forKey: "enabled.\(p.id)") as? Bool ?? true
@@ -563,72 +601,121 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationDidFinishLaunching(_ n: Notification) {
         if CommandLine.arguments.contains("--enable-login") { try? SMAppService.mainApp.register() }
         if CommandLine.arguments.contains("--disable-login") { try? SMAppService.mainApp.unregister() }
+        // Settings from 0.2, when indicators were tied to open app windows.
+        for key in ["claude.alwaysShow", "chatgpt.alwaysShow"] { UserDefaults.standard.removeObject(forKey: key) }
         item.autosaveName = "AIUsageBar"
+        item.isVisible = true  // 0.2 could leave the item hidden, and the autosave would restore that
         item.button?.imagePosition = .imageOnly
         let menu = NSMenu()
         menu.delegate = self
         item.menu = menu
-        Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in self?.tick() }
-        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
-            guard let self else { return }
-            self.providers.filter(self.isEnabled).forEach { $0.refreshNow { [weak self] in self?.render() } }
+        Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in self?.tick() }
+
+        let center = NSWorkspace.shared.notificationCenter
+        center.addObserver(forName: NSWorkspace.screensDidSleepNotification, object: nil, queue: .main) { [weak self] _ in
+            debugLog("display off, pausing")
+            self?.displayAsleep = true
+        }
+        for name in [NSWorkspace.screensDidWakeNotification, NSWorkspace.didWakeNotification] {
+            center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                guard let self else { return }
+                self.displayAsleep = false
+                // Both notifications usually arrive together after sleep; refresh once.
+                guard Date().timeIntervalSince(self.lastWakeRefresh) > 10 else { return }
+                self.lastWakeRefresh = Date()
+                debugLog("wake, refreshing")
+                self.providers.filter(self.isEnabled).forEach { $0.refreshNow(changed: self.changed) }
+            }
+        }
+        center.addObserver(forName: NSWorkspace.didLaunchApplicationNotification, object: nil, queue: .main) { [weak self] note in
+            guard let self,
+                  let id = (note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication)?.bundleIdentifier else { return }
+            for p in self.providers where self.isEnabled(p) && p.appBundleIDs.contains(id) {
+                debugLog("\(id) launched, refreshing \(p.id) in 15 s")
+                // Give the app time to refresh its sign-in first; this also clears an auth backoff.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 15) { [weak self] in
+                    guard let self else { return }
+                    p.refreshNow(changed: self.changed)
+                }
+            }
         }
         tick()
     }
 
-    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        if !item.isVisible {
-            showMenuWhenHidden = true
-            render()
-        }
-        return false
-    }
-
     func tick() {
-        for p in providers where isEnabled(p) { p.tick { [weak self] in self?.render() } }
+        if !displayAsleep {
+            for p in providers where isEnabled(p) { p.tick(changed: changed) }
+        }
         render()
     }
 
+    private func dataChanged() {
+        render()
+        if menuOpen { updateOpenMenu() }
+    }
+
     func render() {
-        let visible = providers.filter { isEnabled($0) && $0.shouldShow }
-        let anyEnabled = providers.contains(where: isEnabled)
-        if !visible.isEmpty { showMenuWhenHidden = false }
-        if visible.isEmpty && anyEnabled && !showMenuWhenHidden {
-            if item.isVisible { item.isVisible = false }
-            return
-        }
-        if !item.isVisible { item.isVisible = true }
-        // Keep the menu reachable when the user reopens the app or disables every service.
-        let segments = visible.isEmpty ? [("AI", "–")] : visible.map { ($0.name, $0.valueText) }
+        let enabled = providers.filter(isEnabled)
+        // Keep a placeholder when every service is off, so the menu stays reachable.
+        let segments = enabled.isEmpty
+            ? [(label: "AI", value: "–", dimmed: false)]
+            : enabled.map { (label: $0.name, value: $0.valueText, dimmed: $0.isStale) }
         item.button?.image = renderBar(segments)
-        if visible.isEmpty {
-            item.button?.toolTip = anyEnabled ? "AIUsageBar" : L("AIUsageBar: no service enabled", "AIUsageBar: kein Dienst aktiviert")
-        } else {
-            item.button?.toolTip = visible.map(\.tooltip).joined(separator: "\n")
+        item.button?.toolTip = enabled.isEmpty
+            ? L("AIUsageBar: no service enabled", "AIUsageBar: kein Dienst aktiviert")
+            : enabled.map(\.tooltip).joined(separator: "\n")
+    }
+
+    private func makeRows(_ p: UsageProvider) -> [NSMenuItem] {
+        let rows = p.infoLines().map(infoItem)
+        rows.forEach { $0.indentationLevel = 1 }
+        return rows
+    }
+
+    /// Replaces detail rows in the open menu without rebuilding it.
+    private func updateOpenMenu() {
+        guard let menu = item.menu else { return }
+        for p in providers {
+            guard let old = infoRows[p.id], let toggle = toggles[p.id] else { continue }
+            let lines = p.infoLines()
+            if lines.count == old.count {
+                for (row, line) in zip(old, lines) where row.title != line { row.title = line }
+                continue
+            }
+            old.forEach(menu.removeItem)
+            let rows = makeRows(p)
+            let start = menu.index(of: toggle) + 1
+            for (k, row) in rows.enumerated() { menu.insertItem(row, at: start + k) }
+            infoRows[p.id] = rows
         }
     }
 
     // Menu is rebuilt each time it opens
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
-        let changed: () -> Void = { [weak self] in self?.render() }
+        toggles = [:]
+        infoRows = [:]
         for p in providers {
             let on = isEnabled(p)
             let toggle = ActionItem(p.name, state: on ? .on : .off) { [weak self] in
                 guard let self else { return }
                 self.setEnabled(p, !on)
-                if !on { p.refreshNow(changed: changed) }
-                self.tick()
+                if !on { p.refreshNow(changed: self.changed) }
+                self.render()
             }
             menu.addItem(toggle)
             if on {
-                for i in p.menuItems(changed: changed) { i.indentationLevel = 1; menu.addItem(i) }
+                let rows = makeRows(p)
+                toggles[p.id] = toggle
+                infoRows[p.id] = rows
+                rows.forEach(menu.addItem)
+                for i in p.actionItems() { i.indentationLevel = 1; menu.addItem(i) }
             }
             menu.addItem(.separator())
         }
         let refresh = ActionItem(L("Refresh now", "Jetzt aktualisieren")) { [weak self] in
             guard let self else { return }
-            self.providers.filter(self.isEnabled).forEach { $0.refreshNow(changed: changed) }
+            self.providers.filter(self.isEnabled).forEach { $0.refreshNow(changed: self.changed) }
         }
         refresh.keyEquivalent = "r"
         menu.addItem(refresh)
@@ -638,6 +725,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         })
         menu.addItem(.separator())
         menu.addItem(withTitle: L("Quit", "Beenden"), action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        menuOpen = true
+        for p in providers where isEnabled(p) { p.menuOpened(changed: changed) }
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        menuOpen = false
+        toggles = [:]
+        infoRows = [:]
     }
 }
 
